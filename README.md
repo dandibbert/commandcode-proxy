@@ -419,8 +419,8 @@ The proxy receives OpenAI `image_url` format and converts it to the above CC for
 Pre-built multi-arch images (`linux/amd64` + `linux/arm64`) are published to the GitHub Container Registry automatically on every `v*` tag via GitHub Actions:
 
 ```bash
-docker pull ghcr.io/maxeaglet/commandcode-proxy:latest
-docker run -d --name cc-proxy -p 3050:3050 -e PORT=3050 ghcr.io/maxeaglet/commandcode-proxy:latest
+docker pull ghcr.io/dandibbert/commandcode-proxy:latest
+docker run -d --name cc-proxy -p 3050:3050 -e PORT=3050 ghcr.io/dandibbert/commandcode-proxy:latest
 ```
 
 The `latest` tag is updated on each release. The image is public — no login required to pull.
