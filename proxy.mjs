@@ -485,7 +485,7 @@ function buildCcRequest(openaiReq, threadId) {
     skills: null,               // command-code ≥1.0.0 传 null（原为空字符串）
     permissionMode: 'standard',
     threadId,                   // 会话内稳定 UUID（≥1.0.0 新增字段）
-    mode: 'interactive',        // ≥1.0.0 新增字段
+    mode: 'agent',              // ≥1.0.0 新增字段;服务端枚举 agent|learning|custom-agent|custom-agent-create|title-gen|tool-desc|compact|vision(正常对话=agent)
     params: {
       model: model || 'deepseek/deepseek-v4-flash',
       messages: ccMessages,
@@ -1843,43 +1843,48 @@ async function handleMessages(req, res) {
 
 // ── 动态模型列表 ────────────────────────────────────
 
-let dynamicModels = null;
+let dynamicModels = null;   // 最近一次成功的在线列表
 let modelsLastFetch = 0;
+let modelsRefreshing = false;
 
-async function fetchModels(apiKey) {
-  const now = Date.now();
-  if (dynamicModels && (now - modelsLastFetch) < CFG.modelRefreshIntervalMs) {
-    return dynamicModels;
-  }
-
+// 刷新只影响下一次请求,绝不阻塞当前响应(上游不可达时客户端最坏等 2.5s 而不是 10s+)
+async function refreshModels(apiKey, maxWaitMs = 10000) {
+  if (modelsRefreshing) return;
+  modelsRefreshing = true;
   try {
-    if (!apiKey || !CFG.useProviderModels) throw new Error('Provider models disabled');
-
     const session = ensureSession(apiKey);
     const response = await fetch(`${CFG.apiBase}/provider/v1/models`, {
       headers: buildCommandHeaders(apiKey, session.sessionId, fakeProjectSlug(session.sessionId)),
-      signal: AbortSignal.timeout(10000),
+      signal: AbortSignal.timeout(maxWaitMs),
     });
-
     if (response.ok) {
       const data = await response.json();
-      if (Array.isArray(data.data)) {
-        dynamicModels = data.data.map(m => ({
-          id: m.id,
-          name: m.id,
-        }));
-        modelsLastFetch = now;
+      if (Array.isArray(data.data) && data.data.length > 0) {
+        dynamicModels = data.data.map(m => ({ id: m.id, name: m.id }));
+        modelsLastFetch = Date.now();
         log('info', 'Fetched models from Provider API', { count: dynamicModels.length });
-        return dynamicModels;
       }
+    } else {
+      log('warn', 'Provider models fetch failed, keeping current list', { status: response.status });
     }
-    log('warn', 'Provider models fetch failed, using hardcoded list', { status: response.status });
   } catch (e) {
-    log('warn', 'Provider models fetch error, using hardcoded list', { error: e.message });
+    log('warn', 'Provider models fetch error, keeping current list', { error: e.message });
+  } finally {
+    modelsRefreshing = false;
   }
+}
 
-  // Fallback to hardcoded MODELS
-  return MODELS;
+async function fetchModels(apiKey) {
+  if (!CFG.useProviderModels) return MODELS;
+  const stale = !dynamicModels || (Date.now() - modelsLastFetch) >= CFG.modelRefreshIntervalMs;
+  if (stale && apiKey) {
+    if (dynamicModels) {
+      refreshModels(apiKey);              // 有缓存:立即返回旧列表,后台换新
+    } else {
+      await refreshModels(apiKey, 2500);  // 首次无缓存:最多等 2.5s(真机一般 <1s)
+    }
+  }
+  return dynamicModels || MODELS;         // 内置列表兜底,永不空响应
 }
 
 async function handleModels(req, res) {
