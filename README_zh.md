@@ -344,13 +344,14 @@ Anthropic SDK 通过 `x-api-key` 头鉴权——代理已原生支持（无需 `
 
 | 机制 | 实现 |
 |------|------|
-| **设备指纹** | 每个 Key 首次请求前发送 `POST /alpha/fingerprint/record`；随机指纹池（15 种 CPU、全球时区）、SHA-256 哈希、per-key 绑定，每 8h+2h 抖动刷新 |
-| **生命周期声明** | 会话初始化时与指纹并行发送 `POST /alpha/lifecycle-events`（`cli_session_exists`） |
-| **按 Key 分 Session** | 每个 API Key 独立 session，12h 过期 + 1h 随机抖动 |
+| **设备指纹** | 按实例发送 `POST /alpha/fingerprint/record`；随机指纹池（15 种 CPU、全球时区）、SHA-256 哈希；指纹持久化到 `.fingerprint-state.json`，跨重启保持不变（真实机器硬件指纹终生不变，按 key 轮换反而像同一账号频繁换设备），每 8h+2h 抖动重新上报 |
+| **生命周期声明** | 会话初始化时与指纹并行发送 `POST /alpha/lifecycle-events`（`cli_session_exists`）；metadata 使用会话内稳定的 `sess_*` id（与真实 CLI 格式一致） |
+| **按 Key 分 Session** | 每个 API Key 独立 session（稳定 `x-session-id` UUID + `threadId`），12h 过期 + 1h 随机抖动 |
+| **User-Agent** | 所有上游请求携带 `User-Agent: cli`（CLI ≥1.38 新增） |
 | **动态版本号** | `x-command-code-version` 从 npm registry 自动拉取（24h 刷新） |
-| **CLI 信封格式** | config/memory/taste/skills/permissionMode/params |
+| **CLI 信封格式** | config/memory/taste/skills(null)/permissionMode/threadId/mode/params |
 | **OpenTelemetry** | `traceparent` (W3C Trace Context) |
-| **环境标识** | `x-cli-environment: production`、`x-co-flag: "false"`、`x-taste-learning: "false"` |
+| **环境标识** | `x-cli-environment: production`、`x-taste-learning: "false"` |
 | **Project Slug** | 从 sessionId 生成的 `x-project-slug`（与真实 CLI 格式一致） |
 | **思考强度** | `reasoning_effort` 透传 (low/medium/high/max) |
 | **API Key 格式验证** | 对 `Authorization: Bearer` 或 `x-api-key` 用正则 `user_[a-zA-Z0-9_-]+` 提取，自动清理多余路径/前缀，`sk-xxx` 等非 `user_` 格式拒 |
@@ -379,8 +380,10 @@ Anthropic SDK 通过 `x-api-key` 头鉴权——代理已原生支持（无需 `
   },
   "memory": null,
   "taste": null,
-  "skills": "",
+  "skills": null,
   "permissionMode": "standard",
+  "threadId": "3f2504e0-4f89-11d3-9a0c-0305e82c3301",
+  "mode": "interactive",
   "params": {
     "model": "deepseek/deepseek-v4-flash",
     "messages": [...],
@@ -401,7 +404,7 @@ CLI 发送图片的格式：
 {
   "role": "user",
   "content": [
-    { "type": "image", "image": "data:image/jpeg;base64,..." },
+    { "type": "image", "image": "data:image/jpeg;base64,...", "mimeType": "image/jpeg" },
     { "type": "text", "text": "图里写了什么" }
   ]
 }

@@ -5,7 +5,7 @@
 import http from 'http';
 import crypto from 'crypto';
 import { randomUUID } from 'crypto';
-import { readFileSync, existsSync, appendFileSync } from 'fs';
+import { readFileSync, writeFileSync, existsSync, appendFileSync } from 'fs';
 import { resolve, dirname } from 'path';
 import { fileURLToPath } from 'url';
 
@@ -118,8 +118,26 @@ function generateFingerprint() {
   };
 }
 
-let CC_VERSION = '0.32.3';
-const CC_VERSION_FALLBACK = '0.32.3';
+// ── 指纹持久化：按实例稳定 ──
+// 真实机器的硬件指纹终生不变；按 key 轮换指纹反而会形成「同一账号频繁换设备」的可检测信号。
+// 因此指纹生成一次后写入 .fingerprint-state.json，跨重启复用（与 config.json 同目录）。
+const FINGERPRINT_STATE_FILE = resolve(__dirname, '.fingerprint-state.json');
+
+function loadOrGenerateFingerprint() {
+  try {
+    if (existsSync(FINGERPRINT_STATE_FILE)) {
+      const saved = JSON.parse(readFileSync(FINGERPRINT_STATE_FILE, 'utf-8'));
+      if (saved?.thumbmark && saved?.components) return saved;
+    }
+  } catch {}
+  const fp = generateFingerprint();
+  try { writeFileSync(FINGERPRINT_STATE_FILE, JSON.stringify(fp, null, 2), 'utf-8'); } catch {}
+  return fp;
+}
+const INSTANCE_FINGERPRINT = loadOrGenerateFingerprint();
+
+let CC_VERSION = '1.38.2';
+const CC_VERSION_FALLBACK = '1.38.2';
 const CC_VERSION_REFRESH_MS = 24 * 60 * 60 * 1000; // 24h — npm registry 刷新间隔
 
 // ── 动态 CC 版本号（从 npm registry 拉取） ─────────────
@@ -163,32 +181,36 @@ function log(level, msg, data) {
 const SESSION_DURATION_MS = 12 * 60 * 60 * 1000;    // 12h
 const SESSION_JITTER_MS  = 60 * 60 * 1000;           // 1h 抖动范围
 
-const sessionStore = new Map(); // apiKey → { sessionId, expiresAt }
+const sessionStore = new Map(); // apiKey → { sessionId, threadId, lifecycleSessionId, expiresAt }
 
 function ensureSession(apiKey) {
   const now = Date.now();
   const entry = sessionStore.get(apiKey);
 
   if (entry && now < entry.expiresAt) {
-    return entry.sessionId;
+    return entry;
   }
 
-  // 过期或第一次：生成新 session
+  // 过期或第一次：生成新 session（真实 CLI 一次进程启动 = 一个会话）
   const jitter = Math.floor(Math.random() * SESSION_JITTER_MS);
-  const sessionId = randomUUID();
-  sessionStore.set(apiKey, { sessionId, expiresAt: now + SESSION_DURATION_MS + jitter });
-      log('info', 'Session created', { sessionId: sessionId.slice(0, 8), storeSize: sessionStore.size });
-  return sessionId;
+  const fresh = {
+    sessionId: randomUUID(),                                              // x-session-id header
+    threadId: randomUUID(),                                               // body.threadId（≥1.0.0 新增，会话内稳定）
+    lifecycleSessionId: `sess_${crypto.randomBytes(8).toString('hex')}`,  // lifecycle metadata（真实格式 sess_+16hex）
+    expiresAt: now + SESSION_DURATION_MS + jitter,
+  };
+  sessionStore.set(apiKey, fresh);
+  log('info', 'Session created', { sessionId: fresh.sessionId.slice(0, 8), storeSize: sessionStore.size });
+  return fresh;
 }
 
-// 定期清理过期 session 和 key 状态，防止 Map 无限增长
+// 定期清理过期 session，防止 Map 无限增长（指纹按实例持久化，不随 session 清理）
 setInterval(() => {
   const now = Date.now();
   let cleaned = 0;
   for (const [key, entry] of sessionStore) {
     if (now >= entry.expiresAt) {
       sessionStore.delete(key);
-      keyStateStore.delete(key); // 同时清理该 key 的指纹状态
       cleaned++;
     }
   }
@@ -205,27 +227,35 @@ function getSessionId(incomingHeaders, apiKey) {
     if (id && typeof id === 'string' && id.length >= 8) return id;
   }
   // 按 API Key 分 session
-  return ensureSession(apiKey);
+  return ensureSession(apiKey).sessionId;
 }
 
-// 每个请求独立 thread ID
-function newThreadId() { return randomUUID(); }
-
-// ── 每 Key 独立状态（fingerprint + 初始化节流） ──
-// 每个 API Key 拥有自己的设备指纹和初始化定时器
-const keyStateStore = new Map(); // apiKey → { fingerprint, nextInitAt }
+// ── 每 Key 独立状态（初始化节流） ──
+// 指纹按实例持久化（见 loadOrGenerateFingerprint），不随 key/session 变化
+const keyStateStore = new Map(); // apiKey → { nextInitAt }
 
 function getOrCreateKeyState(apiKey) {
   let state = keyStateStore.get(apiKey);
   if (!state) {
-    state = {
-      fingerprint: generateFingerprint(),
-      nextInitAt: 0,
-    };
+    state = { nextInitAt: 0 };
     keyStateStore.set(apiKey, state);
-    log('info', 'Fingerprint generated for key', { keyPrefix: apiKey.slice(0, 8) });
+    log('info', 'Key state created', { keyPrefix: apiKey.slice(0, 8) });
   }
   return state;
+}
+
+// ── CC 请求公共 headers（对齐 command-code@1.38.x buildCommandAuthHeaders） ──
+function buildCommandHeaders(apiKey, sessionId, projectSlug) {
+  return {
+    'Content-Type': 'application/json',
+    'User-Agent': 'cli',                     // 1.38.x 起真实 CLI 所有请求都携带
+    'Authorization': `Bearer ${apiKey}`,
+    'x-cli-environment': 'production',
+    'x-command-code-version': CC_VERSION,
+    'x-session-id': sessionId,
+    'x-project-slug': projectSlug,
+    'x-taste-learning': 'false',
+  };
 }
 
 // ── 初始化预请求（fingerprint + lifecycle，首次 + 每 8h+2h 抖动） ────
@@ -238,14 +268,10 @@ async function ensureInitialized(apiKey, signal) {
   if (now < state.nextInitAt) return;
 
   try {
-    // 并行发两个预请求
-    const headers = {
-      'Content-Type': 'application/json',
-      'x-cli-environment': 'production',
-      'Authorization': `Bearer ${apiKey}`,
-      'x-command-code-version': CC_VERSION,
-    };
-    const fingerprint = state.fingerprint || {};
+    // 并行发两个预请求（headers 与真实 CLI commandAuthHeaders 完全对齐）
+    const session = ensureSession(apiKey);
+    const headers = buildCommandHeaders(apiKey, session.sessionId, fakeProjectSlug(session.sessionId));
+    const fingerprint = INSTANCE_FINGERPRINT;
 
     await Promise.all([
       fetch(`${CFG.apiBase}/alpha/fingerprint/record`, {
@@ -263,7 +289,7 @@ async function ensureInitialized(apiKey, signal) {
         body: JSON.stringify({
           eventType: 'cli_session_exists',
           metadata: {
-            sessionId: `sess_${crypto.randomBytes(8).toString('hex')}`,
+            sessionId: session.lifecycleSessionId,   // 会话内稳定，格式与真实 CLI 一致（sess_+16hex）
             cliVersion: CC_VERSION,
             mode: 'interactive',
             os: `${fingerprint.components.platform}-${fingerprint.components.arch}`,
@@ -364,7 +390,7 @@ function getEnvironment() {
 
 // ── CC 请求体构建 ─────────────────────────────────
 
-function buildCcRequest(openaiReq) {
+function buildCcRequest(openaiReq, threadId) {
   const { model, messages, max_tokens, temperature, tools, stream, reasoning_effort, tool_choice, parallel_tool_calls } = openaiReq;
 
   // 从 messages 中提取 system prompt
@@ -395,8 +421,11 @@ function buildCcRequest(openaiReq) {
         const parts = msg.content.map(part => {
           if (part.type === 'image_url') {
             const url = part.image_url?.url || '';
-            // CC CLI 真实格式: { type: "image", image: "data:image/jpeg;base64,..." }
-            return { type: 'image', image: url };
+            // CC CLI 真实格式: { type: "image", image: "data:image/jpeg;base64,...", mimeType: "image/jpeg" }
+            const imagePart = { type: 'image', image: url };
+            const mt = url.match(/^data:([^;,]+)/);
+            if (mt) imagePart.mimeType = mt[1];
+            return imagePart;
           }
           return part;
         }).filter(Boolean);
@@ -439,8 +468,6 @@ function buildCcRequest(openaiReq) {
     return msg;
   });
 
-  const threadId = newThreadId();
-
   const body = {
     config: {
       workingDir: process.cwd(),
@@ -455,8 +482,10 @@ function buildCcRequest(openaiReq) {
     },
     memory: null,
     taste: null,
-    skills: '',
+    skills: null,               // command-code ≥1.0.0 传 null（原为空字符串）
     permissionMode: 'standard',
+    threadId,                   // 会话内稳定 UUID（≥1.0.0 新增字段）
+    mode: 'interactive',        // ≥1.0.0 新增字段
     params: {
       model: model || 'deepseek/deepseek-v4-flash',
       messages: ccMessages,
@@ -476,8 +505,8 @@ function buildCcRequest(openaiReq) {
     body.params.reasoning_effort = reasoning_effort;
   }
   if (tools && tools.length > 0) {
+    // 真实 wire 格式仅 { name, description, input_schema }（toWireTools），无 type 字段
     body.params.tools = tools.map(t => ({
-      type: t.type || 'function',
       name: t.function?.name || t.name || '',
       description: t.function?.description || t.description || '',
       input_schema: t.function?.parameters || t.input_schema || { type: 'object', properties: {} },
@@ -754,21 +783,14 @@ function getApiKey(headers) {
 
 async function forwardToCC(body, apiKey, incomingHeaders = {}, signal) {
   const url = `${CFG.apiBase}/alpha/generate`;
-  const traceparent = generateTraceparent();
   const sessionId = getSessionId(incomingHeaders, apiKey);
+  const session = ensureSession(apiKey);
 
   const response = await fetch(url, {
     method: 'POST',
     headers: {
-      'Content-Type': 'application/json',
-      'Authorization': `Bearer ${apiKey}`,
-      'x-cli-environment': 'production',
-      'x-command-code-version': CC_VERSION,
-      'x-session-id': sessionId,
-      'x-co-flag': 'false',
-      'x-taste-learning': 'false',
-      'x-project-slug': fakeProjectSlug(sessionId),
-      'traceparent': traceparent,
+      ...buildCommandHeaders(apiKey, sessionId, fakeProjectSlug(session.sessionId)),
+      'traceparent': generateTraceparent(),   // x-co-flag 已在 CLI ≥1.30 移除，不再发送
     },
     body: JSON.stringify(body),
     signal,
@@ -799,8 +821,8 @@ async function handleChatCompletions(req, res) {
   const completionId = `chatcmpl-${randomUUID().slice(0, 12)}`;
   const created = nowUnix();
 
-  // 构建 CC 请求体
-  const ccBody = buildCcRequest(openaiReq);
+  // 构建 CC 请求体（threadId 与该 key 会话绑定）
+  const ccBody = buildCcRequest(openaiReq, ensureSession(apiKey).threadId);
 
   // AbortController 用于客户端断连时真正打断 CC 上游（pi-commandcode-provider 模式）
   const abortController = new AbortController();
@@ -1552,7 +1574,7 @@ async function handleMessages(req, res) {
 
   // Convert Anthropic → OpenAI → CC
   const openaiReq = convertAnthropicToOpenAI(anthropicReq);
-  const ccBody = buildCcRequest(openaiReq);
+  const ccBody = buildCcRequest(openaiReq, ensureSession(apiKey).threadId);
 
   const abortController = new AbortController();
   let aborted = false;
@@ -1833,12 +1855,9 @@ async function fetchModels(apiKey) {
   try {
     if (!apiKey || !CFG.useProviderModels) throw new Error('Provider models disabled');
 
+    const session = ensureSession(apiKey);
     const response = await fetch(`${CFG.apiBase}/provider/v1/models`, {
-      headers: {
-        'Authorization': `Bearer ${apiKey}`,
-        'x-cli-environment': 'production',
-        'x-command-code-version': CC_VERSION,
-      },
+      headers: buildCommandHeaders(apiKey, session.sessionId, fakeProjectSlug(session.sessionId)),
       signal: AbortSignal.timeout(10000),
     });
 

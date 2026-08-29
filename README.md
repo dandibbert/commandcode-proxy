@@ -344,13 +344,14 @@ Based on analysis of official CLI traffic (version auto-fetched from npm registr
 
 | Mechanism | Implementation |
 |-----------|---------------|
-| **Device Fingerprint** | `POST /alpha/fingerprint/record` before first request per key; random fingerprint pool (15 CPUs, global timezones), SHA-256 hashed, per-key binding, refreshed every 8h + 2h jitter |
-| **Lifecycle Events** | `POST /alpha/lifecycle-events` (`cli_session_exists`) sent in parallel with fingerprint on session init |
-| **Per-Key Session** | One session per API key, 12h expiry + 1h random jitter |
+| **Device Fingerprint** | `POST /alpha/fingerprint/record` per instance; random fingerprint pool (15 CPUs, global timezones), SHA-256 hashed, persisted to `.fingerprint-state.json` and stable across restarts (real hardware fingerprints never change — rotating per key would look like the same account switching devices), re-recorded every 8h + 2h jitter |
+| **Lifecycle Events** | `POST /alpha/lifecycle-events` (`cli_session_exists`) sent in parallel with fingerprint on session init; stable `sess_*` metadata id per session (matches CLI format) |
+| **Per-Key Session** | One session per API key (stable `x-session-id` UUID + `threadId`), 12h expiry + 1h random jitter |
+| **User-Agent** | `User-Agent: cli` on every upstream request (added upstream in CLI ≥1.38) |
 | **Version** | `x-command-code-version` auto-fetched from npm registry (24h refresh) |
-| **CLI Envelope** | config/memory/taste/skills/permissionMode/params |
+| **CLI Envelope** | config/memory/taste/skills(null)/permissionMode/threadId/mode/params |
 | **OpenTelemetry** | `traceparent` (W3C Trace Context) |
-| **Environment** | `x-cli-environment: production`, `x-co-flag: "false"`, `x-taste-learning: "false"` |
+| **Environment** | `x-cli-environment: production`, `x-taste-learning: "false"` |
 | **Project Slug** | `x-project-slug` generated from session ID (CLI-compatible format) |
 | **Reasoning Effort** | `reasoning_effort` pass-through (low/medium/high/max) |
 | **Key Validation** | Regex `user_[a-zA-Z0-9_-]+` on `Authorization: Bearer` or `x-api-key`, auto-cleans extra paths/prefixes, rejects `sk-xxx` format |
@@ -379,8 +380,10 @@ Based on analysis of official CLI traffic (version auto-fetched from npm registr
   },
   "memory": null,
   "taste": null,
-  "skills": "",
+  "skills": null,
   "permissionMode": "standard",
+  "threadId": "3f2504e0-4f89-11d3-9a0c-0305e82c3301",
+  "mode": "interactive",
   "params": {
     "model": "deepseek/deepseek-v4-flash",
     "messages": [...],
@@ -401,7 +404,7 @@ The CLI sends images in this format:
 {
   "role": "user",
   "content": [
-    { "type": "image", "image": "data:image/jpeg;base64,..." },
+    { "type": "image", "image": "data:image/jpeg;base64,...", "mimeType": "image/jpeg" },
     { "type": "text", "text": "What does this image say?" }
   ]
 }
