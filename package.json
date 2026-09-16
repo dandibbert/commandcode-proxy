@@ -1,8 +1,8 @@
 {
   "name": "commandcode-proxy",
-  "version": "1.0.0",
+  "version": "1.0.3",
   "type": "module",
-  "description": "Command Code → OpenAI 兼容代理",
+  "description": "Command Code \u2192 OpenAI \u517c\u5bb9\u4ee3\u7406",
   "license": "MIT",
   "main": "proxy.mjs",
   "scripts": {
