@@ -6,7 +6,7 @@
 
 基于对官方 CLI 网络流量的分析，精确还原了 Command Code API 的请求协议（含设备指纹与生命周期预请求），并实现了多层兼容适配。
 
-**完整功能**：OpenAI Chat Completions + Anthropic Messages API | 流式/非流式输出 | 工具调用 (tool_use) | 多模态图片输入 | 推理强度 (reasoning_effort) | 动态模型列表 | 缓存命中指标 | 设备指纹伪装（per-key 绑定、自动刷新）| `x-api-key` 鉴权（Anthropic SDK）| 客户端断连检测（上游中止） | 零输出 → 429 自动重试 | 连续超时 → 429 自动重试 | 隐私保护日志
+**完整功能**：OpenAI Chat Completions + OpenAI Responses + Anthropic Messages API | `developer`/`input_text` 会规范成 Command Code 能吃的格式 | 流式/非流式输出 | 工具调用 (tool_use) | 多模态图片输入 | 推理强度 (reasoning_effort) | 动态模型列表 | 缓存命中指标 | 设备指纹伪装（per-key 绑定、自动刷新）| `x-api-key` 鉴权（Anthropic SDK）| 客户端断连检测（上游中止） | 零输出 → 429 自动重试 | 连续超时 → 429 自动重试 | 隐私保护日志
 
 **社区**: [Linux.do](https://linux.do) — 一个友好的中文技术社区。
 
@@ -33,7 +33,8 @@ commandcode/
 ├── config.json           # 端口 / 日志路径等
 ├── LICENSE               # MIT License
 ├── package.json          # npm start / npm run dev
-├── proxy.mjs             # 单文件核心代理（~1900 行）
+├── proxy.mjs             # 代理核心
+├── convert.mjs           # Chat / Responses → Command Code 消息规范化
 ├── Dockerfile            # 容器构建文件（node:22-alpine）
 ├── docker-compose.yml    # 容器编排
 ├── .dockerignore         # 构建上下文排除规则
@@ -83,7 +84,7 @@ OpenAI Chat Completions 兼容。支持流式和非流式、工具调用、多�
 | 参数 | 必填 | 说明 |
 |------|------|------|
 | `model` | 是 | 模型 ID（见模型列表） |
-| `messages` | 是 | 对话消息，支持 `system/user/assistant/tool` 角色 |
+| `messages` | 是 | 对话消息。`system`/`developer` 会折进 CC 的 `params.system`，其余只保留 `user`/`assistant`/`tool`。数组 `content` 和 Responses 的 `input_text` 块都能收。 |
 | `max_tokens` | 否 | 最大生成 token（默认 64000） |
 | `stream` | 否 | 是否 SSE 流式（默认 false） |
 | `temperature` | 否 | 采样温度（0-2）|
@@ -161,6 +162,24 @@ data: [DONE]
     "total_tokens": 7600,
     "prompt_tokens_details": { "cached_tokens": 7552 }
   }
+}
+```
+
+### `POST /v1/responses`
+
+给 Codex 一类客户端的最小 OpenAI Responses 兼容。请求里的 `input` / `instructions` / `developer` 会先转成 Chat Completions，再转成 Command Code。流式会发 `response.created` / `response.output_text.delta` / `response.completed`。
+
+打到 `/v1/chat/completions` 的 Responses 形态请求体也会被收下。
+
+**请求体：**
+```json
+{
+  "model": "deepseek/deepseek-v4.1-flash",
+  "input": [
+    { "type": "message", "role": "developer", "content": [{ "type": "input_text", "text": "be terse" }] },
+    { "type": "message", "role": "user", "content": [{ "type": "input_text", "text": "hello" }] }
+  ],
+  "stream": true
 }
 ```
 

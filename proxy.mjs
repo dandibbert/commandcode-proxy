@@ -8,6 +8,7 @@ import { randomUUID } from 'crypto';
 import { readFileSync, writeFileSync, existsSync, appendFileSync } from 'fs';
 import { resolve, dirname } from 'path';
 import { fileURLToPath } from 'url';
+import { convertResponsesToChat, normalizeIncoming } from './convert.mjs';
 
 // ── 配置加载 ──────────────────────────────────────
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -394,9 +395,10 @@ function buildCcRequest(openaiReq, threadId) {
   const { model, messages, max_tokens, temperature, tools, stream, reasoning_effort, tool_choice, parallel_tool_calls } = openaiReq;
 
   // 从 messages 中提取 system prompt
-  const systemMsgs = messages.filter(m => m.role === 'system');
-  const systemPrompt = systemMsgs.map(m => m.content).join('\n');
-  const chatMessages = messages.filter(m => m.role !== 'system');
+  const msgs = Array.isArray(messages) ? messages : [];
+  const systemMsgs = msgs.filter(m => m.role === 'system');
+  const systemPrompt = systemMsgs.map(m => (typeof m.content === 'string' ? m.content : String(m.content ?? ''))).join('\n');
+  const chatMessages = msgs.filter(m => m.role !== 'system');
 
   // Build tool_call_id → tool_name reverse lookup
   const toolNameMap = {};
@@ -465,7 +467,12 @@ function buildCcRequest(openaiReq, threadId) {
         }],
       };
     }
-    return msg;
+    // Unknown roles (developer/system already stripped) must not be forwarded:
+    // CC validates params.messages[].role as user|assistant|tool only.
+    return {
+      role: 'user',
+      content: [{ type: 'text', text: typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content ?? '') }],
+    };
   });
 
   const body = {
@@ -801,12 +808,21 @@ async function forwardToCC(body, apiKey, incomingHeaders = {}, signal) {
 
 // ── 路由 ────────────────────────────────────────────
 
-async function handleChatCompletions(req, res) {
+async function handleChatCompletions(req, res, preParsed) {
   let openaiReq;
-  try {
-    openaiReq = await readBody(req);
-  } catch {
-    sendJSON(res, 400, { error: { message: 'Invalid JSON body', type: 'invalid_request_error' } });
+  if (preParsed) {
+    openaiReq = preParsed;
+  } else {
+    try {
+      openaiReq = await readBody(req);
+    } catch {
+      sendJSON(res, 400, { error: { message: 'Invalid JSON body', type: 'invalid_request_error' } });
+      return;
+    }
+    openaiReq = normalizeIncoming(openaiReq);
+  }
+  if (!Array.isArray(openaiReq.messages) || openaiReq.messages.length === 0) {
+    sendJSON(res, 400, { error: { message: 'messages is required', type: 'invalid_request_error' } });
     return;
   }
 
@@ -1142,6 +1158,334 @@ async function handleChatCompletions(req, res) {
       log('error', 'Upstream error', { message: e.message });
       try { abortController.abort(); } catch {} // 打断 CC 上游
       sendJSON(res, 502, { error: { message: `Upstream error: ${e.message}`, type: 'proxy_error', input_tokens: 0 }, retry_after: 10 });
+    }
+  }
+}
+
+// ── OpenAI /v1/responses ────────────────────────────
+
+function sseNamed(type, payload) {
+  return `event: ${type}\ndata: ${JSON.stringify({ type, ...payload })}\n\n`;
+}
+
+function createResponsesSseTranslator(model, responseId, created) {
+  let started = false;
+  let textStarted = false;
+  let text = '';
+  let finishReason = 'stop';
+  const functionCalls = [];
+  const outputItemId = `msg_${responseId.slice(0, 12)}`;
+
+  function ensureStart(out) {
+    if (started) return;
+    started = true;
+    const response = {
+      id: responseId,
+      object: 'response',
+      created_at: created,
+      status: 'in_progress',
+      model,
+      output: [],
+    };
+    out.push(sseNamed('response.created', { response }));
+    out.push(sseNamed('response.in_progress', { response }));
+  }
+
+  function ensureText(out) {
+    ensureStart(out);
+    if (textStarted) return;
+    textStarted = true;
+    out.push(sseNamed('response.output_item.added', {
+      output_index: 0,
+      item: { type: 'message', id: outputItemId, role: 'assistant', status: 'in_progress', content: [] },
+    }));
+    out.push(sseNamed('response.content_part.added', {
+      output_index: 0,
+      content_index: 0,
+      item_id: outputItemId,
+      part: { type: 'output_text', text: '' },
+    }));
+  }
+
+  return {
+    lastCcEvent: '',
+    inputTokens: 0,
+    outputTokens: 0,
+    cachedInputTokens: 0,
+    parseLine(line) {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed === '[DONE]' || trimmed.startsWith(':')) return null;
+      let event;
+      try { event = JSON.parse(trimmed); } catch { return null; }
+      if (!event.type) return null;
+      this.lastCcEvent = event.type;
+      const out = [];
+
+      switch (event.type) {
+        case 'text-delta': {
+          const delta = event.text || event.delta || '';
+          if (!delta) break;
+          ensureText(out);
+          text += delta;
+          out.push(sseNamed('response.output_text.delta', {
+            output_index: 0,
+            content_index: 0,
+            item_id: outputItemId,
+            delta,
+          }));
+          break;
+        }
+        case 'tool-call': {
+          ensureStart(out);
+          const callId = event.toolCallId || `call_${Date.now()}_${functionCalls.length}`;
+          const name = event.toolName || '';
+          const args = typeof event.input === 'string' ? event.input : JSON.stringify(event.input || {});
+          const item = {
+            type: 'function_call',
+            id: callId,
+            call_id: callId,
+            name,
+            arguments: args,
+            status: 'completed',
+          };
+          functionCalls.push(item);
+          out.push(sseNamed('response.output_item.added', {
+            output_index: functionCalls.length - 1 + (textStarted ? 1 : 0),
+            item,
+          }));
+          out.push(sseNamed('response.function_call_arguments.done', {
+            output_index: functionCalls.length - 1 + (textStarted ? 1 : 0),
+            item_id: callId,
+            arguments: args,
+          }));
+          break;
+        }
+        case 'finish': {
+          const u = event.totalUsage || {};
+          normalizeUsage(u);
+          this.inputTokens = u.inputTokens ?? 0;
+          this.outputTokens = u.outputTokens ?? 0;
+          this.cachedInputTokens = u.cachedInputTokens ?? 0;
+          finishReason = mapFinishReason(event.finishReason || finishReason);
+          break;
+        }
+        case 'finish-step':
+          if (event.finishReason) finishReason = mapFinishReason(event.finishReason);
+          if (event.usage) {
+            this.inputTokens = event.usage.inputTokens ?? 0;
+            this.outputTokens = event.usage.outputTokens ?? 0;
+            this.cachedInputTokens = event.usage.cachedInputTokens ?? 0;
+          }
+          break;
+        case 'error':
+          log('warn', 'CC stream error', { message: event.error?.message || event.message });
+          break;
+        default:
+          break;
+      }
+      return out.length > 0 ? out : null;
+    },
+    getCompletedEvent() {
+      const output = [];
+      if (textStarted || text) {
+        output.push({
+          type: 'message',
+          id: outputItemId,
+          role: 'assistant',
+          status: 'completed',
+          content: [{ type: 'output_text', text }],
+        });
+      }
+      for (const fc of functionCalls) output.push(fc);
+      const status = finishReason === 'tool_calls' ? 'completed' : 'completed';
+      const response = {
+        id: responseId,
+        object: 'response',
+        created_at: created,
+        status,
+        model,
+        output,
+        usage: {
+          input_tokens: this.inputTokens,
+          output_tokens: this.outputTokens,
+          total_tokens: this.inputTokens + this.outputTokens,
+          input_tokens_details: { cached_tokens: this.cachedInputTokens },
+        },
+      };
+      return sseNamed('response.completed', { response });
+    },
+    buildCompletedResponse() {
+      const output = [];
+      if (text) {
+        output.push({
+          type: 'message',
+          id: outputItemId,
+          role: 'assistant',
+          status: 'completed',
+          content: [{ type: 'output_text', text }],
+        });
+      }
+      for (const fc of functionCalls) output.push(fc);
+      return {
+        id: responseId,
+        object: 'response',
+        created_at: created,
+        status: 'completed',
+        model,
+        output,
+        usage: {
+          input_tokens: this.inputTokens,
+          output_tokens: this.outputTokens,
+          total_tokens: this.inputTokens + this.outputTokens,
+          input_tokens_details: { cached_tokens: this.cachedInputTokens },
+        },
+      };
+    },
+    get text() { return text; },
+  };
+}
+
+async function handleResponses(req, res) {
+  let raw;
+  try {
+    raw = await readBody(req);
+  } catch {
+    sendJSON(res, 400, { error: { message: 'Invalid JSON body', type: 'invalid_request_error' } });
+    return;
+  }
+  const openaiReq = convertResponsesToChat(raw);
+  if (!Array.isArray(openaiReq.messages) || openaiReq.messages.length === 0) {
+    sendJSON(res, 400, { error: { message: 'input is required', type: 'invalid_request_error' } });
+    return;
+  }
+
+  const apiKey = getApiKey(req.headers);
+  if (!apiKey) {
+    sendJSON(res, 401, { error: { message: 'Missing API key. Send in Authorization: Bearer *** or x-api-key header', type: 'auth_error' } });
+    return;
+  }
+
+  const stream = openaiReq.stream === true || raw.stream === true;
+  const model = openaiReq.model || raw.model || 'deepseek/deepseek-v4-flash';
+  const responseId = `resp_${randomUUID().slice(0, 12)}`;
+  const created = nowUnix();
+  const ccBody = buildCcRequest(openaiReq, ensureSession(apiKey).threadId);
+  const abortController = new AbortController();
+  let aborted = false;
+  const startTime = Date.now();
+  let bytesReceived = 0;
+  let lastCcEvent = '';
+  let keepaliveCount = 0;
+  let reader = null;
+  let translator = null;
+
+  try {
+    await ensureInitialized(apiKey, abortController.signal);
+    const ccResponse = await forwardToCC(ccBody, apiKey, req.headers, abortController.signal);
+    if (!ccResponse.ok) {
+      const errorText = await ccResponse.text().catch(() => '');
+      log('error', 'CC API error', { status: ccResponse.status });
+      const mapped = mapCcError(ccResponse.status, errorText);
+      sendJSON(res, mapped.status, mapped.body);
+      return;
+    }
+
+    res.on('close', () => {
+      if (res.writableEnded) return;
+      aborted = true;
+      if (!abortController.signal.aborted) {
+        try { abortController.abort(); } catch {}
+      }
+    });
+
+    translator = createResponsesSseTranslator(model, responseId, created);
+    reader = ccResponse.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    let started = false;
+
+    const writeEvents = (events) => {
+      if (!events) return;
+      if (stream && !started) {
+        res.writeHead(200, {
+          'Content-Type': 'text/event-stream',
+          'Cache-Control': 'no-cache',
+          'Connection': 'keep-alive',
+          'X-Accel-Buffering': 'no',
+        });
+        started = true;
+      }
+      if (stream) {
+        for (const evt of events) res.write(evt);
+      }
+    };
+
+    while (true) {
+      const result = await Promise.race([
+        reader.read(),
+        new Promise((_, reject) =>
+          setTimeout(() => reject(new Error('STREAM_IDLE_TIMEOUT')), stream ? STREAM_IDLE_TIMEOUT_MS : NONSTREAM_IDLE_TIMEOUT_MS)
+        ),
+      ]);
+      const { done, value } = result;
+      if (done) break;
+      if (aborted) break;
+      bytesReceived += value.length;
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\n');
+      buffer = lines.pop() || '';
+      let hadOutput = false;
+      for (const line of lines) {
+        const events = translator.parseLine(line);
+        if (events) {
+          writeEvents(events);
+          hadOutput = true;
+        }
+        if (translator.lastCcEvent) lastCcEvent = translator.lastCcEvent;
+      }
+      if (stream && started && !hadOutput) { try { res.write(': keepalive\n\n'); keepaliveCount++; } catch {} }
+    }
+    if (buffer.trim()) writeEvents(translator.parseLine(buffer));
+
+    if (aborted) return;
+    if (translator.outputTokens === 0 && !translator.text) {
+      sendJSON(res, 429, { error: { message: 'Empty response from upstream (zero output tokens)', type: 'rate_limit_error' }, retry_after: 10 });
+      return;
+    }
+    consecutiveTimeouts = 0;
+    if (stream) {
+      writeEvents([translator.getCompletedEvent()]);
+      if (!res.writableEnded) res.end();
+    } else {
+      sendJSON(res, 200, translator.buildCompletedResponse());
+    }
+  } catch (e) {
+    if (abortController.signal.aborted || aborted) {
+      log('warn', 'Request cancelled (client disconnected before CC response)', {
+        path: '/v1/responses',
+        model,
+        responseId,
+      });
+    } else if (e.message === 'STREAM_IDLE_TIMEOUT') {
+      log('warn', 'Stream idle timeout', {
+        path: '/v1/responses',
+        model,
+        streaming: stream,
+        timeoutMs: stream ? STREAM_IDLE_TIMEOUT_MS : NONSTREAM_IDLE_TIMEOUT_MS,
+        elapsedMs: Date.now() - startTime,
+        id: responseId,
+        bytesReceived,
+        lastCcEvent: lastCcEvent || '(none)',
+        keepaliveCount,
+      });
+      try { reader?.cancel(); } catch {}
+      try { abortController.abort(); } catch {}
+      consecutiveTimeouts++;
+      sendJSON(res, 429, { error: { message: 'Response timeout - request timed out', type: 'rate_limit_error' }, retry_after: 5 });
+    } else {
+      log('error', 'Upstream error', { message: e.message });
+      try { abortController.abort(); } catch {}
+      sendJSON(res, 502, { error: { message: `Upstream error: ${e.message}`, type: 'proxy_error' } });
     }
   }
 }
@@ -1926,6 +2270,8 @@ const server = http.createServer(async (req, res) => {
   try {
     if (url.pathname === '/v1/chat/completions' && req.method === 'POST') {
       await handleChatCompletions(req, res);
+    } else if (url.pathname === '/v1/responses' && req.method === 'POST') {
+      await handleResponses(req, res);
     } else if (url.pathname === '/v1/messages' && req.method === 'POST') {
       await handleMessages(req, res);
     } else if (url.pathname === '/v1/models' && req.method === 'GET') {

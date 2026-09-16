@@ -6,7 +6,7 @@ A reverse proxy that converts Command Code API to OpenAI / Anthropic compatible 
 
 Built by analyzing official CLI network traffic to accurately replicate the Command Code API request protocol, including device-fingerprint and lifecycle pre-requests.
 
-**Features**: OpenAI Chat Completions + Anthropic Messages API | Streaming & non-streaming | Tool calling (tool_use) | Multimodal image input | Reasoning effort | Dynamic model list | Cache hit metrics | Device fingerprint disguise (per-key, auto-refresh) | `x-api-key` auth (Anthropic SDK) | Client disconnect detection with upstream abort | Zero-output → 429 auto-retry | Consecutive timeout → 429 auto-retry | Privacy-aware logging
+**Features**: OpenAI Chat Completions + OpenAI Responses + Anthropic Messages API | `developer`/`input_text` normalized for Command Code | Streaming & non-streaming | Tool calling (tool_use) | Multimodal image input | Reasoning effort | Dynamic model list | Cache hit metrics | Device fingerprint disguise (per-key, auto-refresh) | `x-api-key` auth (Anthropic SDK) | Client disconnect detection with upstream abort | Zero-output → 429 auto-retry | Consecutive timeout → 429 auto-retry | Privacy-aware logging
 
 **Community**: [Linux.do](https://linux.do) — a friendly Chinese tech community.
 
@@ -33,7 +33,8 @@ commandcode/
 ├── config.json           # Port / log path etc.
 ├── LICENSE               # MIT License
 ├── package.json          # npm start / npm run dev
-├── proxy.mjs             # Single-file proxy core (~1900 lines)
+├── proxy.mjs             # Proxy core
+├── convert.mjs           # Chat / Responses → Command Code message normalize
 ├── Dockerfile            # Container build (node:22-alpine)
 ├── docker-compose.yml    # Container orchestration
 ├── .dockerignore         # Build context exclusions
@@ -83,7 +84,7 @@ OpenAI Chat Completions compatible. Supports streaming, non-streaming, tool call
 | Parameter | Required | Description |
 |-----------|----------|-------------|
 | `model` | Yes | Model ID (see model list) |
-| `messages` | Yes | Conversation messages, supports `system/user/assistant/tool` roles |
+| `messages` | Yes | Conversation messages. `system`/`developer` are folded into CC `params.system`; remaining roles are `user`/`assistant`/`tool`. Array `content` and Responses `input_text` parts are accepted. |
 | `max_tokens` | No | Max tokens to generate (default 64000) |
 | `stream` | No | SSE streaming (default false) |
 | `temperature` | No | Sampling temperature (0-2) |
@@ -161,6 +162,24 @@ data: [DONE]
     "total_tokens": 7600,
     "prompt_tokens_details": { "cached_tokens": 7552 }
   }
+}
+```
+
+### `POST /v1/responses`
+
+Minimal OpenAI Responses compatibility for Codex-style clients. Request `input` / `instructions` / `developer` messages are converted to Chat Completions, then to Command Code. Streaming emits `response.created` / `response.output_text.delta` / `response.completed`.
+
+A Responses-shaped body posted to `/v1/chat/completions` is also accepted.
+
+**Request body:**
+```json
+{
+  "model": "deepseek/deepseek-v4.1-flash",
+  "input": [
+    { "type": "message", "role": "developer", "content": [{ "type": "input_text", "text": "be terse" }] },
+    { "type": "message", "role": "user", "content": [{ "type": "input_text", "text": "hello" }] }
+  ],
+  "stream": true
 }
 ```
 
