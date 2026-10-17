@@ -5,5 +5,11 @@
   "apiBase": "https://api.commandcode.ai",
   "projectSlug": "cc-proxy",
   "logFile": "",
-  "logLevel": "info"
+  "logLevel": "info",
+  "zdr": false,
+  "upstreamProxy": "",
+  "fingerprintSalt": "",
+  "deviceProjectDir": "",
+  "cliMode": "agent",
+  "cliSessionMode": "interactive"
 }

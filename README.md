@@ -6,7 +6,7 @@ A reverse proxy that converts Command Code API to OpenAI / Anthropic compatible 
 
 Built by analyzing official CLI network traffic to accurately replicate the Command Code API request protocol, including device-fingerprint and lifecycle pre-requests.
 
-**Features**: OpenAI Chat Completions + OpenAI Responses + Anthropic Messages API | `developer`/`input_text` normalized for Command Code | Streaming & non-streaming | Tool calling (tool_use) | Multimodal image input | Reasoning effort | Dynamic model list | Cache hit metrics | Device fingerprint disguise (per-key, auto-refresh) | `x-api-key` auth (Anthropic SDK) | Client disconnect detection with upstream abort | Zero-output → 429 auto-retry | Consecutive timeout → 429 auto-retry | Privacy-aware logging
+**Features**: OpenAI Chat Completions / **Responses API (`/v1/responses`)** + Anthropic Messages API | Streaming & non-streaming | Tool calling (tool_use) | Multimodal image input | Reasoning effort | Dynamic model list | Cache hit metrics | Device fingerprint disguise (per-key, auto-refresh) | `x-api-key` auth (Anthropic SDK) | Client disconnect detection with upstream abort | Zero-output guard (429 non-streaming / response.failed streaming) | Consecutive timeout → 429 auto-retry | Privacy-aware logging
 
 **Community**: [Linux.do](https://linux.do) — a friendly Chinese tech community.
 
@@ -33,14 +33,13 @@ commandcode/
 ├── config.json           # Port / log path etc.
 ├── LICENSE               # MIT License
 ├── package.json          # npm start / npm run dev
-├── proxy.mjs             # Proxy core
-├── convert.mjs           # Chat / Responses → Command Code message normalize
+├── proxy.mjs             # Single-file proxy core (~1900 lines)
 ├── Dockerfile            # Container build (node:22-alpine)
 ├── docker-compose.yml    # Container orchestration
 ├── .dockerignore         # Build context exclusions
 ├── .github/
 │   └── workflows/
-│       └── docker-publish.yml  # GHCR multi-arch publish on v* tags
+│       └── docker-publish.yml  # release branch / v* tags → GHCR multi-arch (latest + release)
 ├── captured-requests/    # Captured CLI traffic (protocol analysis reference)
 ├── README.md             # This document (English)
 └── README_zh.md          # Chinese documentation
@@ -61,17 +60,126 @@ commandcode/
 | `logLevel` | `info` | Log level |
 | `useProviderModels` | `true` | Dynamically fetch model list from Provider API |
 | `modelRefreshIntervalMs` | `300000` | Model list cache refresh interval (5 min) |
+| `zdr` | `false` | Request ZDR-only routing from Command Code |
+| `cliMode` | `agent` | Envelope `mode`. Upstream enum: `agent` / `learning` / `custom-agent` / `custom-agent-create` / `title-gen` / `tool-desc` / `compact` / `vision` |
+| `cliSessionMode` | `interactive` | `mode` inside the lifecycle metadata (**a different enum**: `interactive` / `non-interactive`) |
+| `fingerprintSalt` | `""` | Salt for the device fingerprint — use it to rotate the whole fleet's identity (one key still always reports one device) |
+| `deviceProjectDir` | `""` | Faked project directory (empty = built-in `C:\Users\dev\projects\app`); changing it gives every account a different device |
+| `emptySystemPlaceholder` | `true` | Send a space placeholder when there is no system prompt, preventing upstream from injecting its ~7.5K-token default ([#17](https://github.com/MAXeaglet/commandcode-proxy/issues/17)) |
 
 ### Environment Variables
 
-| Variable | Overrides |
-|----------|-----------|
-| `PORT` | `port` |
-| `HOST` | `host` |
-| `CC_API_BASE` | `apiBase` |
-| `PROJECT_SLUG` | `projectSlug` |
-| `LOG_FILE` | `logFile` |
-| `CC_USE_PROVIDER_MODELS` | `useProviderModels` |
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `PORT` | `3000` (shipped config.json uses `3050`) | Listen port → `port` |
+| `HOST` | `0.0.0.0` | Listen address → `host` |
+| `CC_API_BASE` | `https://api.commandcode.ai` | Upstream base URL → `apiBase` |
+| `CC_UPSTREAM_PROXY` | *(unset)* | Route requests **to the CC upstream** through an HTTP proxy (`http://` CONNECT only); see "Upstream proxy" below → `upstreamProxy` |
+| `PROJECT_SLUG` | `cc-proxy` | `x-project-slug` → `projectSlug` |
+| `LOG_FILE` | empty | Log file → `logFile` (**synchronous writes**, see [Other notes](#other-notes)) |
+| `CC_USE_PROVIDER_MODELS` | `true` | Fetch the model list dynamically → `useProviderModels` |
+| `CMD_ZDR` | off | `1` enables ZDR-only routing → `zdr` |
+| `CC_CLI_MODE` | `agent` | Envelope `mode` → `cliMode` |
+| `CC_CLI_SESSION_MODE` | `interactive` | Lifecycle metadata `mode` → `cliSessionMode` |
+| `CC_FINGERPRINT_SALT` | empty | Fingerprint salt → `fingerprintSalt` |
+| `CC_DEVICE_PROJECT_DIR` | empty | Faked project directory → `deviceProjectDir` |
+| `CC_EMPTY_SYSTEM_PLACEHOLDER` | `true` | Space placeholder for a missing system prompt; `false` disables → `emptySystemPlaceholder` |
+| `CC_MAX_BODY_MB` | `100` | Max request body size in MB; oversized requests get `413` |
+| `CC_MAX_TOOL_IMAGE_MB` | `6` | Total per-request budget for tool screenshots (base64); older ones become a placeholder; `0` disables. See [Tool screenshot budget](#tool-screenshot-budget) |
+| `CC_STREAM_IDLE_MS` | `30000` | Streaming upstream read idle timeout; see [Upstream idle timeouts](#upstream-idle-timeouts) |
+| `CC_NONSTREAM_IDLE_MS` | `90000` | Non-streaming upstream read idle timeout |
+| `CC_UPSTREAM_RETRY_MAX` | `2` | Retries for upstream disconnects **before any byte is written downstream**; `0` disables; see [Upstream transient retry](#upstream-transient-retry) |
+| `CC_UPSTREAM_RETRY_BASE_MS` | `400` | Backoff base in ms; the actual delay is base × attempt number |
+| `CC_MAX_INFLIGHT` | `0` (unlimited) | In-process request cap; over-limit returns `503`; see [In-flight cap](#in-flight-cap-optional) |
+| `CC_CLIENT_DRAIN_TIMEOUT_MS` | unset (disabled) | Drop the client once downstream backpressure blocks longer than this; see [Stalled clients](#stalled-clients-neither-reading-nor-disconnecting) |
+| `CC_KEEPALIVE_TIMEOUT_MS` | `65000` | Backend keep-alive timeout (`headersTimeout` is set to +1s automatically). **Must be larger than the reverse proxy's keepalive_timeout** — see [keep-alive ordering](#suggested-nginx-front) |
+
+When enabled, the proxy sends `x-cmd-zdr: 1` on Command Code generation requests
+and the fingerprint/lifecycle initialization requests. It does not add the header
+to the npm version check or the proxy's `/provider/v1/models` catalog request.
+This requests Command Code's ZDR-only routing; the upstream service remains the
+authority for actual retention and provider availability.
+
+**Request body limit**: independent of `config.json` — requests larger than **100 MB** are rejected with `HTTP 413` (the connection is kept alive and drained, not reset). Override with `CC_MAX_BODY_MB` (positive integer, unit: MB).
+
+> ⚠️ **Memory amplification**: a request body exists in several copies before it reaches upstream; measured peak ≈ body size × **5.1–7.4** (7 MB → +52 MB, 20 MB → +116 MB, while a request rejected with `413` costs only ×1.05). The default `CC_MAX_BODY_MB=100` therefore implies up to ~550 MB for a **single** request, and that limit is per-request, not global. See [Memory & Deployment](#memory--deployment).
+
+### Device fingerprint
+
+Relevant config: `fingerprintSalt` / `CC_FINGERPRINT_SALT`, `deviceProjectDir` / `CC_DEVICE_PROJECT_DIR`.
+
+The device fingerprint reported to `/alpha/fingerprint/record` is **derived deterministically** from the API key (`fpDigest(apiKey, field) = sha256(salt + "\\0" + apiKey + "\\0" + field)`), so one key is always one device:
+
+| Event | Old behaviour (random) | Now (derived) |
+|---|---|---|
+| Process restart | Map cleared → **new machine** | same machine |
+| Second instance | same key = **two machines** | same machine |
+| Session expiry (12h) | `keyStateStore.delete` → **new machine every 12h** | same machine |
+
+> The 12h case was the most visible: a real user does not replace their computer twice a day, and upstream's `device_fingerprints` table is keyed on `(userId, thumbmark)`.
+
+**Why derived rather than "pick a device from a hash bucket"** — a fixed pool caps entropy at the pool size, so once the number of keys exceeds it, keys *must* share a fingerprint. With ~50 keys and a 1000-entry pool, ~2 keys collide; with a 100-entry pool, ~20 do. A shared `thumbmark` under two different `userId`s is direct evidence of multi-account-same-machine — exactly what you don't want to manufacture. Derivation keeps every key a distinct device (collision probability 2⁻²⁵⁶) while still being stable.
+
+```bash
+CC_FINGERPRINT_SALT=some-local-secret npm start   # optional: bulk-reset every key's device identity
+CC_DEVICE_PROJECT_DIR='C:\\Users\\you\\projects\\app' npm start   # optional: change the fabricated project dir (slug follows)
+```
+
+The salt is optional but recommended: without it the derivation is a pure function of the API key, so anyone who knows the scheme could recompute your users' fingerprints. With it, the same key yields different devices on different deployments, at no cost.
+
+**The signal values are fabricated too.** The official CLI reads the real machine (Windows registry MachineGuid, NIC MACs, `os.userInfo`, `git config`); this proxy derives plausible-looking substitutes from the API key — MachineGuid's `8-4-4-4-12` shape, `xx:xx:xx:xx:xx:xx` MACs, a `DESKTOP-xxxxxx` hostname, a readable git email. Those raw values never leave process memory; only their hashes go on the wire.
+
+**Pool selection scores-and-takes-the-max rather than using modulo** — modulo would rotate *every* key's device whenever the pool grows; taking the max only affects keys where the new candidate happens to win.
+
+The hash construction follows the official CLI (`buildMachineFingerprint` / `hashSignal` in `command-code`) — `thumbmark = sha256(IB + "\0machine\0" + [machineId, macs.join(",")].join("|"))` with `IB = "command-code:device-fingerprint:v1"`, and each component hashed as `sha256(IB + "\0" + value.toLowerCase())`. The previous implementation hashed random hex without the `IB` prefix and built the thumbmark from the component *hashes*; upstream cannot recompute either way (it never sees the raw `machineId`), so it was undetectable — but it is now aligned.
+
+> Not addressed here: the appearance pool is still all high-end desktop CPUs and the timezone is drawn uniformly from a global pool.
+>
+> `timezone` is the **client machine's OS timezone** (`Intl.DateTimeFormat().resolvedOptions().timeZone`), *not* the egress IP's. So do **not** bind it to the egress IP: a user in mainland China reaching this service through a proxy normally has a machine timezone that does not match where the traffic exits, and that mismatch is the norm rather than an anomaly.
+>
+> The property that matters is therefore the **distribution across your own user base**, not agreement with the IP. If your users are concentrated in one region, drawing timezones uniformly from 15 global zones makes every account look like it belongs to a different continent. Set the pool to match who actually uses the deployment — this is an operator decision, and for a single-region user base it means narrowing (or weighting) `FINGERPRINT_TZS` rather than randomising it globally.
+### Tool screenshot budget
+
+Images inside tool results are sent upstream as **separate** `image` blocks (an `input_image` inside
+`function_call_output.output` is no longer `JSON.stringify`-ed into the tool-result text). Base64 is extremely
+expensive once upstream tokenizes it as **text** — a single 2.76 MB Codex Desktop screenshot measured
+≈ **1.92M tokens**, blowing straight through a 1M window:
+
+```
+400 This model's maximum context length is 1048576 tokens. However, you requested
+    1986800 tokens (1922800 in the messages, 64000 in the completion)
+```
+
+Images are still **re-sent in full every turn**: one real session carried 11 screenshots ≈5.5 MB of base64,
+which — with the memory amplification above (×5.1–7.4) — pushed the proxy to `anon-rss 532 MB` and triggered a
+**global OOM** on a 1 GB box. `CC_MAX_TOOL_IMAGE_MB` (default `6`) keeps the **newest** images within budget
+(at least one) and replaces the rest with `[older tool screenshot omitted: image budget exceeded]`, so the model
+knows an image was dropped instead of assuming none ever existed. Only tool screenshots are affected; images
+you attach yourself are untouched.
+
+> Raise the budget if the model really needs every screenshot, but size memory as `budget × in-flight × 5–7`
+> (see [in-flight cap](#in-flight-cap-optional)).
+
+### Upstream proxy (`upstreamProxy` / `CC_UPSTREAM_PROXY`)
+
+Route the requests the proxy makes **to Command Code** through a local HTTP proxy — for egress-region switching, or for comparing IPs when debugging risk-control `403`s.
+
+```json
+{ "upstreamProxy": "http://127.0.0.1:7890" }
+```
+
+```bash
+CC_UPSTREAM_PROXY=http://127.0.0.1:7890 npm start
+```
+
+- Applies to `/alpha/generate`, `/alpha/fingerprint/record`, `/alpha/lifecycle-events` and `/provider/v1/models`.
+- **Does not** touch the local listener, `/health`, or the npm version check.
+- Only `http://` (CONNECT) proxies are supported. Implemented with a plain CONNECT tunnel plus `node:https` reusing the same socket, so there is **no new dependency** and it works on Node 18+.
+- Each upstream request opens its own tunnel connection. TLS is end-to-end: the certificate is validated against the **target hostname**, never against the proxy.
+- Routing the fingerprint/lifecycle pre-requests through the same proxy matters: if they went out direct while generation went through the proxy, one account would register from two different IPs — exactly the inconsistency you are trying to avoid.
+- Credentials in the proxy URL (`http://user:pass@host:port`) are never logged: only `host:port` shows up.
+
+> Node's built-in `fetch` does **not** read `HTTPS_PROXY`/`HTTP_PROXY`. The official env-var route requires Node ≥ 22.21 / 24.5 plus `NODE_USE_ENV_PROXY=1`; this option works without either.
 
 ## API Endpoints
 
@@ -84,7 +192,7 @@ OpenAI Chat Completions compatible. Supports streaming, non-streaming, tool call
 | Parameter | Required | Description |
 |-----------|----------|-------------|
 | `model` | Yes | Model ID (see model list) |
-| `messages` | Yes | Conversation messages. `system`/`developer` are folded into CC `params.system`; remaining roles are `user`/`assistant`/`tool`. Array `content` and Responses `input_text` parts are accepted. |
+| `messages` | Yes | Conversation messages, supports `system/user/assistant/tool` roles |
 | `max_tokens` | No | Max tokens to generate (default 64000) |
 | `stream` | No | SSE streaming (default false) |
 | `temperature` | No | Sampling temperature (0-2) |
@@ -165,24 +273,6 @@ data: [DONE]
 }
 ```
 
-### `POST /v1/responses`
-
-Minimal OpenAI Responses compatibility for Codex-style clients. Request `input` / `instructions` / `developer` messages are converted to Chat Completions, then to Command Code. Streaming emits `response.created` / `response.output_text.delta` / `response.completed`.
-
-A Responses-shaped body posted to `/v1/chat/completions` is also accepted.
-
-**Request body:**
-```json
-{
-  "model": "deepseek/deepseek-v4.1-flash",
-  "input": [
-    { "type": "message", "role": "developer", "content": [{ "type": "input_text", "text": "be terse" }] },
-    { "type": "message", "role": "user", "content": [{ "type": "input_text", "text": "hello" }] }
-  ],
-  "stream": true
-}
-```
-
 ### `POST /v1/messages`
 
 Anthropic Messages API compatible endpoint. Supports streaming, non-streaming, and tool calling.
@@ -253,6 +343,24 @@ data: {"type":"message_stop"}
 }
 ```
 
+### `POST /v1/responses`
+
+OpenAI **Responses API** (what Codex and the newer OpenAI SDKs speak).
+
+The request side is translated: `input` (message array; items may omit `type`), `instructions`, `max_output_tokens`, `temperature`, `top_p`, `reasoning`, `tools` and `tool_choice` all map onto the CC envelope; the response comes back in Responses shape (`object: "response"`, `output` array, `usage`, `status`). Streaming is SSE:
+`response.created` / `response.in_progress` / `response.output_item.added|done` / `response.content_part.added|done` / `response.output_text.delta|done` / `response.reasoning_summary_text.delta|done` / `response.function_call_arguments.delta|done`, terminated by `response.completed` (`response.incomplete` when truncated by `max_output_tokens`, `response.failed` on error).
+
+- **Stateless**: `previous_response_id` is not supported and answers `400` — send the full `input` every turn (the proxy stores no conversation history).
+- Errors use the Responses shape: `{"error":{"message":...,"type":...}}`.
+- Shares the same upstream call path, cache breakpoints and idle watchdog as `/v1/chat/completions`.
+- **First-token silence and keep-alive**: `response.created` / `response.in_progress` are emitted **immediately** once upstream returns `200`, and a `: keepalive` SSE comment follows every 5 s while waiting. Time-to-first-token for a reasoning model with a large prompt measured 15–40 s; that silent window used to put **zero bytes** on the wire, so intermediate layers (EdgeOne's origin idle timeout measured ~15 s) or client first-byte timeouts cut the connection — visible as nginx `499` with `body_bytes_sent=0` and a client retrying every 15 s. SSE comments must be ignored by clients per spec (`/v1/messages` uses `event: ping`, but Responses has no ping event and an unknown event type risks strict-parser errors).
+
+```bash
+curl http://127.0.0.1:3050/v1/responses \
+  -H "Authorization: Bearer user_xxxxxxxxx" -H "Content-Type: application/json" \
+  -d '{"model":"deepseek/deepseek-v4-flash","input":[{"role":"user","content":[{"type":"input_text","text":"hi"}]}]}'
+```
+
 ### `GET /v1/models`
 
 Returns available model list. Fetched dynamically from Provider API (5 min cache), falls back to hardcoded list on failure.
@@ -263,12 +371,29 @@ Health check. Returns `OK`.
 
 ## Error Codes
 
-| HTTP Status | Description |
-|-------------|-------------|
-| 400 | Invalid request format |
-| 401 | API Key missing / invalid format / rejected (Key must start with `user_`; sent via `Authorization: Bearer` or `x-api-key`) |
-| 429 | Zero output tokens, or idle timeout (30s streaming / 90s non-streaming) — SDK auto-retry with `Retry-After`; after 3 consecutive timeouts a "reduce context" hint is returned |
-| 502 | CC upstream error |
+Produced by the proxy itself:
+
+| HTTP | When |
+|------|------|
+| `400` | Body is not valid JSON, `input` is empty, or an unsupported `previous_response_id` is used |
+| `401` | API key missing / malformed (must start with `user_`; sent via `Authorization: Bearer` or `x-api-key`) |
+| `404` | Unknown path |
+| `413` | Body exceeds `CC_MAX_BODY_MB` (connection kept alive and drained, not reset) |
+| `429` | Zero output tokens (non-streaming only; streaming reports 200 + `response.failed`, see "Zero-Output Guard"), stream idle timeout (30s streaming / 90s non-streaming), or an upstream rate-limit mapping — all carry `Retry-After` so SDKs back off; after 3 consecutive timeouts a "reduce context" hint is returned |
+| `502` | CC upstream error (connection-level failures such as `fetch failed` also land here) |
+| `503` | `CC_MAX_INFLIGHT` is set and the in-flight cap is exceeded (`type: server_busy`) |
+
+Upstream CC status mapping (`CC_STATUS_MAP`; anything unlisted becomes `502 upstream_error`):
+
+| Upstream | Downstream |
+|----------|------------|
+| `400` → `400 invalid_request_error` | `401` → `401 authentication_error` |
+| `402` → `429 rate_limit_error` (payment failures are treated as rate limits) | `403` → `401 authentication_error` |
+| `404` → `404 not_found` | `422` → `400 invalid_request_error` |
+| `429` → `429 rate_limit_error` (with `retry_after: 30`) | `500` / `502` → `502 upstream_error` |
+| `503` → `503 temporarily_unavailable` | anything else → `502 upstream_error` |
+
+The machine-readable classification from the upstream error body (`error.code`, e.g. `BAD_REQUEST` / `USAGE_EXCEEDED`) is passed through as `error.code`.
 
 ## Model List
 
@@ -359,24 +484,24 @@ The Anthropic SDK authenticates via the `x-api-key` header — supported by the 
 
 ## Anti-Detection
 
-Based on analysis of official CLI traffic (version auto-fetched from npm registry):
+Aligned line-by-line against the official npm package source (`command-code@1.53.1`; `dist/cli.mjs` is minified but **not obfuscated**). Newer npm releases only raise a drift **warning** — the proxy never silently bumps the version it claims:
 
 | Mechanism | Implementation |
 |-----------|---------------|
-| **Device Fingerprint** | `POST /alpha/fingerprint/record` per instance; random fingerprint pool (15 CPUs, global timezones), SHA-256 hashed, persisted to `.fingerprint-state.json` and stable across restarts (real hardware fingerprints never change — rotating per key would look like the same account switching devices), re-recorded every 8h + 2h jitter |
-| **Lifecycle Events** | `POST /alpha/lifecycle-events` (`cli_session_exists`) sent in parallel with fingerprint on session init; stable `sess_*` metadata id per session (matches CLI format) |
-| **Per-Key Session** | One session per API key (stable `x-session-id` UUID + `threadId`), 12h expiry + 1h random jitter |
-| **User-Agent** | `User-Agent: cli` on every upstream request (added upstream in CLI ≥1.38) |
-| **Version** | `x-command-code-version` auto-fetched from npm registry (24h refresh) |
-| **CLI Envelope** | config/memory/taste/skills(null)/permissionMode/threadId/mode/params |
+| **Device Fingerprint** | `POST /alpha/fingerprint/record` before first request per key; signal values (Windows MachineGuid shape, real-shaped MACs, `DESKTOP-xxxxxx` hostname) are **derived deterministically from the API key** and hashed exactly like the CLI, so one key always reports the same device — across restarts, memory reclamation and multiple instances (bulk reset via `CC_FINGERPRINT_SALT`) |
+| **Lifecycle Events** | `POST /alpha/lifecycle-events` (`cli_session_exists`, metadata `{sessionId, cliVersion, mode, os}`) sent in parallel with the fingerprint on key init, using the same `User-Agent: cli` as generate |
+| **Session ID** | Taken from the client header when present (`x-session-id` / `x-claude-code-session-id` / `session_id` / `prompt_cache_key`); otherwise **derived deterministically from the request** — `sha1(apiKey + model + system + user text up to the first non-user message)` formatted as a UUID. |
+| **Version** | `x-command-code-version` reports the **protocol version actually implemented** (currently `1.53.1`); newer npm releases only raise a drift **warning**, never a silent version bump |
+| **CLI Envelope** | 9 keys: `config / memory / taste / skills / permissionMode / threadId / mode / promptCache / params` |
 | **OpenTelemetry** | `traceparent` (W3C Trace Context) |
-| **Environment** | `x-cli-environment: production`, `x-taste-learning: "false"` |
-| **Project Slug** | `x-project-slug` generated from session ID (CLI-compatible format) |
+| **Environment** | `x-cli-environment: production`, `x-taste-learning: "false"`, `User-Agent: cli` |
+| **Project Slug** | `x-project-slug` = `slugify(DEVICE_PROFILE.projectDir)` — same source as `config.workingDir` (default `C:\Users\dev\projects\app`, override with `CC_DEVICE_PROJECT_DIR`) |
+| **Single Source of Device Truth** | Fingerprint / `config.environment` / `config.workingDir` / `x-project-slug` / lifecycle `os` all read one `DEVICE_PROFILE` (`win32` / `x64`) — so they cannot contradict each other ("fingerprint says win32, environment says linux"), and the host's real platform, Node version and cwd are never handed upstream |
 | **Reasoning Effort** | `reasoning_effort` pass-through (low/medium/high/max) |
 | **Key Validation** | Regex `user_[a-zA-Z0-9_-]+` on `Authorization: Bearer` or `x-api-key`, auto-cleans extra paths/prefixes, rejects `sk-xxx` format |
 | **Stream Timeout** | 30s streaming / 90s non-streaming → 429 with SDK auto-retry |
 | **Consecutive Timeout** | 3 consecutive timeouts before "reduce context" hint |
-| **Zero-Output Guard** | outputTokens=0 → 429 `rate_limit_error` (SDK auto-retry, anti false billing) |
+| **Zero-Output Guard** | outputTokens=0 with no output item: non-streaming → 429 `rate_limit_error` (SDK auto-retry, anti false billing); streaming — where `response.created` is sent eagerly per #54 — → 200 + `response.failed` (upstream_error). Empty responses are never dressed up as success ([#56](https://github.com/MAXeaglet/commandcode-proxy/issues/56)) |
 | **Upstream Abort** | `AbortController` on client disconnect + all error paths |
 | **Privacy Logging** | No API key fragments, no error bodies, no stack traces in logs |
 
@@ -389,7 +514,7 @@ Based on analysis of official CLI traffic (version auto-fetched from npm registr
   "config": {
     "workingDir": "C:\\project",
     "date": "2026-06-07",
-    "environment": "win32-x64, Node.js v24.16.0",
+    "environment": "win32",
     "structure": [],
     "isGitRepo": false,
     "currentBranch": "",
@@ -401,8 +526,6 @@ Based on analysis of official CLI traffic (version auto-fetched from npm registr
   "taste": null,
   "skills": null,
   "permissionMode": "standard",
-  "threadId": "3f2504e0-4f89-11d3-9a0c-0305e82c3301",
-  "mode": "interactive",
   "params": {
     "model": "deepseek/deepseek-v4-flash",
     "messages": [...],
@@ -413,7 +536,9 @@ Based on analysis of official CLI traffic (version auto-fetched from npm registr
 }
 ```
 
-Conditional fields: `system` (extracted from `system` messages), `temperature`, `reasoning_effort`, `tools` (mapped to CC `input_schema` format).
+`config.environment` and `config.workingDir` come from `DEVICE_PROFILE` (not from the host), and `skills` is `null` (not an empty string).
+
+Conditional fields: `system` (extracted from `system` messages), `temperature`, `reasoning_effort`, `tools` (mapped to CC `input_schema` format), `tool_choice`, `parallel_tool_calls`. When a `prompt_cache_key` is present (or the client already set `cache_control`), the breakpoint lands on the last system block — caching is prefix-based and system is that prefix.
 
 ### CC API Image Message Format
 
@@ -423,7 +548,7 @@ The CLI sends images in this format:
 {
   "role": "user",
   "content": [
-    { "type": "image", "image": "data:image/jpeg;base64,...", "mimeType": "image/jpeg" },
+    { "type": "image", "image": "data:image/jpeg;base64,..." },
     { "type": "text", "text": "What does this image say?" }
   ]
 }
@@ -435,14 +560,19 @@ The proxy receives OpenAI `image_url` format and converts it to the above CC for
 
 ### Pull from GHCR
 
-Pre-built multi-arch images (`linux/amd64` + `linux/arm64`) are published to the GitHub Container Registry automatically on every `v*` tag via GitHub Actions:
+GitHub Actions publishes multi-arch images (`linux/amd64` + `linux/arm64`) to the GitHub Container Registry:
+
+| Tag | Source | Notes |
+|-----|--------|-------|
+| `:release` | `release` branch | Tracks the release branch |
+| `:latest` | `release` branch or `v*` tag | Same digest as `:release`. **"Only updated on version tags" was the old behaviour** — it left `:latest` users stuck on an old build where new endpoints 404'd ([#28](https://github.com/MAXeaglet/commandcode-proxy/issues/28)) |
 
 ```bash
 docker pull ghcr.io/dandibbert/commandcode-proxy:latest
 docker run -d --name cc-proxy -p 3050:3050 -e PORT=3050 ghcr.io/dandibbert/commandcode-proxy:latest
 ```
 
-The `latest` tag is updated on each release. The image is public — no login required to pull.
+The image is public — no login required to pull. After upgrading, confirm the digest actually changed (`docker inspect --format '{{index .RepoDigests 0}}'`) rather than assuming your local cache is current.
 
 ### Quick Start (docker compose)
 
@@ -471,10 +601,193 @@ npm run docker:build:multi
 
 ### Environment Variables
 
+Only two are container-specific; everything else lives in the [Environment Variables](#environment-variables) table above:
+
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `PORT` | `3050` | Container listen port |
 | `PROXY_PORT` | `3050` | Host port (compose only) |
+
+## In-flight Cap (Optional)
+
+**Off by default** (`CC_MAX_INFLIGHT` unset = no concurrency limit), so existing behaviour is unchanged.
+
+This project is a **pure proxy layer**; concurrency control belongs downstream — use your reverse proxy for per-IP / per-key limits (see the `limit_conn` block in [Memory & Deployment](#memory--deployment)). This option is **not** a replacement for that; it only covers running **without** a reverse proxy (which both the Dockerfile and `npm start` invite) with an in-process, **global-only** guard:
+
+```bash
+CC_MAX_INFLIGHT=32 npm start    # at most 32 concurrent requests
+```
+
+Over the limit it returns `503` + `Retry-After: 5` + `type: server_busy` — a shape the official OpenAI / Anthropic SDKs retry with backoff, instead of the client seeing a connection reset. `/health` and `/` are exempt so liveness probes and orchestrators never receive a 503 because business traffic is busy.
+
+**Why it exists**: memory is `in-flight × (0.13 MB + 5.5 × body_MB)`. `CC_MAX_BODY_MB` bounds only the **per-request** term; nothing bounds the multiplier — at the default 100 MB, N concurrent requests can cost N × 550 MB.
+
+> **Why the default body cap stays at 100 MB**: [#7](https://github.com/MAXeaglet/commandcode-proxy/issues/7) recorded a legitimate multimodal session (21 base64 images, ~10.11 MiB) hitting the old 10 MB cap, so the threshold cannot be lowered without breaking real usage — which is exactly why the concurrency side has to be bounded instead. The startup warning about implied worst-case memory is advisory; `CC_MAX_INFLIGHT` is the enforcement.
+
+> ⚠️ Enabling this is **not** the same as being memory-safe: 32 × 550 MB still exceeds a small box. For a hard bound, lower `CC_MAX_BODY_MB` **as well**.
+
+## Upstream Idle Timeouts
+
+Two upstream read idle watchdogs; on expiry the proxy returns `429` (with `retry_after`) so the SDK retries automatically:
+
+| Env var | Default | Applies to |
+|---|---|---|
+| `CC_STREAM_IDLE_MS` | `30000` | Streaming requests |
+| `CC_NONSTREAM_IDLE_MS` | `90000` | Non-streaming requests |
+
+**Semantics**: they measure only the time spent waiting inside `reader.read()`, reset on every received chunk — **not the total request duration**. As long as upstream keeps emitting, the watchdog never fires, even for a request that has been running for tens of minutes.
+
+**The defaults differ from the official CLI, and that is a known trade-off** ([#19](https://github.com/MAXeaglet/commandcode-proxy/issues/19)): the official CLI has **no** upstream idle timeout at all — deobfuscating `command-code@1.50.0` shows every `createApiClient({ baseUrl })` call site passes no `timeout`, and 700+ second stalls complete successfully. This proxy keeps 30 s to catch genuinely dead connections; the cost is that a reasoning model's long prefill/first-token stall can be killed.
+
+If you see `429 Response timeout` or `zero output tokens` where the log shows `elapsedMs ≈ 30000` and `bytesReceived = 0`, the watchdog killed a healthy stall — raise it:
+
+```bash
+CC_STREAM_IDLE_MS=300000 npm start      # 5 minutes
+```
+
+> ⚠️ A false kill costs more than one failed request: the abort returns `429 + retry_after`, the SDK retries automatically, and a retry **resends the entire context** — so each false kill re-pays the full prefill on long conversations.
+
+## Upstream Transient Retry
+
+The CC upstream sometimes kills a connection mid-stream at peak hours (peer RST/FIN), which surfaces in Node as
+`TypeError: terminated`. Before this change the proxy handed that straight to the client as
+`502 {"error":{"message":"Upstream error: terminated","type":"proxy_error"}}`.
+
+As long as **no byte has been written downstream yet**, the request never started from the client's point of view —
+so the proxy can absorb the blip internally instead of making the client eat a 502 and resend its whole context.
+
+- **Retry requires all four**: ① the upstream did not finish — either a transport-level drop (`terminated` /
+  `ECONNRESET` / `ECONNREFUSED` / `EPIPE` / `ETIMEDOUT` / `UND_ERR_SOCKET` / `socket hang up` / `other side closed` /
+  `fetch failed`), or a **clean peer FIN that carried no `finish` event at all** (the same class of truncation as an
+  RST); ② nothing written downstream yet (streaming: no header/event emitted; non-streaming: `headersSent` still
+  false); ③ the client is still connected; ④ the retry cap is not reached.
+- Once any header or event has gone downstream, the proxy **never retries** — the semantics are already committed and a
+  retry would duplicate text.
+- `STREAM_IDLE_TIMEOUT` (the `429` "reduce your context" signal) is deliberately passed through and is **never retried**.
+- If an upstream `error` event (`429` / `503` …) has already been parsed, the proxy does **not** retry, and if the
+  connection then drops it still surfaces that semantic error instead of overwriting it with a transport `502`
+  (reporting "upstream at capacity" as "the proxy broke" would be misleading).
+- A client that disconnects during the backoff abandons the retry — the client is gone, another upstream call would
+  only burn quota.
+- Retries are invisible to the client: it sees a single `200` whose body comes from the attempt that succeeded.
+
+| Env var | Default | Description |
+|---|---|---|
+| `CC_UPSTREAM_RETRY_MAX` | `2` | Max retries (3 attempts in total); `0` disables the behaviour |
+| `CC_UPSTREAM_RETRY_BASE_MS` | `400` | Backoff base in ms; the actual delay is base × attempt number |
+
+Logs to look for: `Upstream stream terminated before first byte - retrying` / `Upstream error before first byte - retrying` /
+`Upstream stream ended incomplete before first byte - retrying` (a retry happened; `attempt` / `maxAttempts` / `cause`
+or `reason` are in the structured fields), `Upstream retry recovered` (the retry **actually delivered** a normal
+response) and `Upstream retry abandoned (client disconnected during backoff)`. The startup banner's `upstreamRetry`
+field shows the effective values.
+
+```bash
+CC_UPSTREAM_RETRY_MAX=0 npm start        # disable retries (behaviour reverts to before this change)
+CC_UPSTREAM_RETRY_BASE_MS=800 npm start  # wider backoff (default 400ms)
+```
+
+> **Scope**: the retry loop covers both the streaming and non-streaming paths of `/v1/chat/completions`.
+> `/v1/messages` and `/v1/responses` have a different structure and are not covered by this change (drops are still
+> reported as before).
+
+## Memory & Deployment
+
+> Measurements reproduced from [issue #20](https://github.com/MAXeaglet/commandcode-proxy/issues/20) (Node v24, loopback mock upstream).
+
+Rule of thumb for per-request memory:
+
+```
+RSS ≈ 70 MB + in-flight × (0.13 MB + 5.5 × body_MB)
+```
+
+### Streaming responses apply backpressure
+
+When `res.write()` returns `false` (the socket write buffer passed `highWaterMark`), reading from upstream pauses, so the response no longer accumulates unbounded in memory:
+
+| Scenario (200 MB upstream stream, client stops reading after sending) | Peak RSS delta |
+|---|---|
+| Before the fix | **+586 MB** (66 → 652 MB) |
+| After the fix | **+4 MB** (backpressure propagates upstream, which stalls after ~8 MB) |
+
+This is not only a hostile-client problem — throttled/mobile links, a client blocked on tool execution, or a client that already gave up but whose TCP stack has not sent RST all trigger it.
+
+### Request body is ~5.5× its size
+
+The body exists in several copies before being forwarded: `chunks[]` / `Buffer.concat` / utf8 string / `JSON.parse` object tree / `buildCcRequest` second object tree / `JSON.stringify` serialized body.
+
+| body | cap | peak delta | status |
+|---|---|---|---|
+| 7 MB | 100 MB | +52 MB (7.4×) | 200 |
+| 20 MB | 100 MB | +116 MB (5.8×) | 200 |
+| 20 MB | 8 MB | +21 MB (1.05×) | **413** |
+
+At startup a `warn` is logged when the implied worst case is ≥ 500 MB. The body limit is **per request** — cap the multiplier with `CC_MAX_INFLIGHT` (in-process, global only), and add per-IP / per-key limits in the reverse proxy. A public deployment should do both.
+
+### Suggested nginx front
+
+Rejecting in nginx means the body is never materialized in the Node process at all:
+
+```nginx
+map $http_authorization $cc_key { default $http_authorization; "" $http_x_api_key; }
+map "" $cc_global_key { default "global"; }
+
+limit_conn_zone $binary_remote_addr zone=cc_ip:10m;
+limit_conn_zone $cc_key             zone=cc_key:10m;
+limit_conn_zone $cc_global_key      zone=cc_global:10m;
+
+location /v1/ {
+    client_max_body_size 4m;   # must be <= CC_MAX_BODY_MB
+    limit_conn cc_ip     8;
+    limit_conn cc_key    4;
+    limit_conn cc_global 32;   # this *is* the memory ceiling
+    limit_conn_status 429;
+    proxy_pass http://127.0.0.1:3050;
+    proxy_http_version 1.1;
+    proxy_set_header Connection "";
+    proxy_buffering off;
+    proxy_read_timeout 300s;   # must exceed the 30s stream idle timeout
+}
+```
+
+> ⚠️ **keep-alive ordering**: `proxy_set_header Connection ""` above keeps connections to the backend alive, so the
+> reverse proxy's `upstream { keepalive_timeout ...; }` **must be smaller than** the backend's `CC_KEEPALIVE_TIMEOUT_MS`
+> (default 65s). Get it backwards and nginx reuses a connection the backend has already FIN'd, then hits `EPIPE` while
+> writing the POST body (visible in the nginx log as `sendfile() failed (32: Broken pipe)`); POST is not idempotent and
+> nginx does not retry it by default — the client gets a bare 502.
+
+### Stalled clients (neither reading nor disconnecting)
+
+Once backpressure is in effect, a client that **neither reads nor disconnects** keeps its request and upstream connection alive indefinitely. Measured residual cost:
+
+| Stalled connections | RSS delta | Upstream connections held |
+|---|---|---|
+| 1 | +5 MB | 1 |
+| 10 | +45 MB | 10 |
+| 50 | +248 MB | 50 (**held forever**) |
+
+The cost is **bounded, does not leak, and is reclaimed as soon as the client disconnects** (the RSS curve stays flat) — but the **number of connections itself is unbounded**.
+
+This is left unhandled by default, because a stalled client is indistinguishable at the protocol level from a *legitimate* client blocked on tool execution, and the official CLI has no upstream idle timeout at all (see [#19](https://github.com/MAXeaglet/commandcode-proxy/issues/19)) — adding an aggressive timeout would repeat the mistake of killing healthy requests.
+
+To cap it, opt in:
+
+```bash
+# only drop a client that has been blocked downstream for over 60s;
+# a client that keeps making drain progress never triggers this
+CC_CLIENT_DRAIN_TIMEOUT_MS=60000 npm start
+```
+
+Measured with the timeout enabled (50 stalled connections): upstream connections held goes from **50 (forever) → 0**, with **no** post-drop draining of upstream.
+
+A more robust cap still belongs at the reverse proxy (`limit_conn`), since only it knows how much concurrency a given deployment can afford.
+
+### Other notes
+
+- **`logFile` uses `appendFileSync`** — synchronous writes on the event loop. Under public load they serialize the loop; prefer leaving it empty and collecting stdout.
+- **systemd guard rails**: set `MemoryMax=` and `NODE_OPTIONS=--max-old-space-size=` so an overshoot kills the proxy, not `sshd`/`nginx`.
+- **Content-derived session id**: without a client-supplied session header the id hashes `apiKey + model + system + user text up to the first non-user message`, so anything that changes inside that prefix — a system prompt carrying today's date, a model switch — gives a different session id mid-conversation, which forces a cache rebuild. Send `x-session-id` or `prompt_cache_key` from the client when you need exact control.
+- **Multi-account + multiple instances**: the only per-process state left is `keyStateStore` (a deterministic fingerprint plus an init throttle per key). The same API key served by two instances therefore reports the **same** device fingerprint and the **same** session id — provided `CC_FINGERPRINT_SALT` and `CC_DEVICE_PROJECT_DIR` are identical on both, or the fingerprints diverge. Only the fingerprint/lifecycle pre-request timing is per-instance, so two instances may each send one init round inside the same window. When scaling out, use consistent hashing on the API key (`hash $cc_key consistent`) rather than round-robin.
 
 ## Disclaimer
 
